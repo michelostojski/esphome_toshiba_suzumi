@@ -140,6 +140,8 @@ void ToshibaClimateUart::getInitData() {
 }
 
 void ToshibaClimateUart::setup() {
+  // Custom fan modes now live on the climate entity (ESPHome >= 2026.4)
+  this->set_supported_custom_fan_modes({CUSTOM_FAN_LEVEL_2, CUSTOM_FAN_LEVEL_4});
   // establish communication
   this->start_handshake();
   // load initial sensor data from the unit
@@ -262,7 +264,7 @@ void ToshibaClimateUart::parseResponse(std::vector<uint8_t> rawData) {
     default: {
       auto fanMode = IntToCustomFanMode(fan_value);
       ESP_LOGI(TAG, "Received fan mode (custom): %s", fanMode.c_str());
-      this->set_custom_fan_mode_(fanMode);
+      this->set_custom_fan_mode_(fanMode.c_str());
       break;
     }
   }
@@ -570,11 +572,11 @@ void ToshibaClimateUart::dump_config() {
     }
   }
 
-  if (call.get_custom_fan_mode().has_value()) {
-    auto fan_mode = *call.get_custom_fan_mode();
-    auto payload = StringToFanLevel(fan_mode);
+  if (call.has_custom_fan_mode()) {
+    auto fan_mode = call.get_custom_fan_mode();
+    auto payload = StringToFanLevel(std::string(fan_mode.c_str(), fan_mode.size()));
     if (payload.has_value()) {
-      ESP_LOGD(TAG, "Setting fan mode to %s", fan_mode);
+      ESP_LOGD(TAG, "Setting fan mode to custom: %s", fan_mode.c_str());
       this->set_custom_fan_mode_(fan_mode);
       this->sendCmd(ToshibaCommandType::FAN, static_cast<uint8_t>(payload.value()));
     }
@@ -601,15 +603,13 @@ ClimateTraits ToshibaClimateUart::traits() {
   } else {
     traits.set_supported_swing_modes({climate::CLIMATE_SWING_OFF, climate::CLIMATE_SWING_VERTICAL});
   }
-  traits.set_supports_current_temperature(true);
+  traits.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
 
   // Toshiba AC has more FAN levels that standard climate component, we have to use custom.
   traits.add_supported_fan_mode(CLIMATE_FAN_AUTO);
   traits.add_supported_fan_mode(CLIMATE_FAN_QUIET);
   traits.add_supported_fan_mode(CLIMATE_FAN_LOW);
-  traits.add_supported_custom_fan_mode(CUSTOM_FAN_LEVEL_2);
   traits.add_supported_fan_mode(CLIMATE_FAN_MEDIUM);
-  traits.add_supported_custom_fan_mode(CUSTOM_FAN_LEVEL_4);
   traits.add_supported_fan_mode(CLIMATE_FAN_HIGH);
 
   traits.set_visual_temperature_step(1);

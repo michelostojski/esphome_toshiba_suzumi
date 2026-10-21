@@ -9,6 +9,10 @@ using namespace esphome::climate;
 
 static const int RECEIVE_TIMEOUT = 200;
 static const int COMMAND_DELAY = 100;
+// Setpoint compensation tuning
+static const float COMP_MAX_OFFSET = 5.0f;                // never shift the unit setpoint by more than this
+static const uint32_t COMP_MIN_INTERVAL_MS = 5 * 60 * 1000;  // at most one automatic setpoint change per 5 min
+static const uint32_t TARGET_PREF_KEY = 0x7051BA01;
 
 /**
  * Checksum is calculated from all bytes excluding start byte.
@@ -140,6 +144,13 @@ void ToshibaClimateUart::getInitData() {
 }
 
 void ToshibaClimateUart::setup() {
+  // Restore the user's target temperature (needed because the unit may hold a compensated setpoint)
+  this->target_pref_ = global_preferences->make_preference<float>(TARGET_PREF_KEY);
+  float saved_target;
+  if (this->target_pref_.load(&saved_target) && !std::isnan(saved_target)) {
+    this->user_target_ = saved_target;
+    ESP_LOGCONFIG(TAG, "Restored user target temperature: %.1f", saved_target);
+  }
   // Custom fan modes now live on the climate entity (ESPHome >= 2026.4)
   this->set_supported_custom_fan_modes({CUSTOM_FAN_LEVEL_2, CUSTOM_FAN_LEVEL_4});
   // establish communication
@@ -231,8 +242,32 @@ void ToshibaClimateUart::parseResponse(std::vector<uint8_t> rawData) {
         value -= SPECIAL_TEMP_OFFSET;
 
         ESP_LOGI(TAG, "Note: Special Mode \"%s\" is active, shifting target temp to %d", SPECIAL_MODE_EIGHT_DEG, value);
+        this->target_temperature = value;
+        break;
       }
-      this->target_temperature = value;
+      if (this->external_sensor_ == nullptr) {
+        // no compensation possible: unit setpoint == user target
+        this->target_temperature = value;
+        this->unit_setpoint_sent_ = value;
+        break;
+      }
+      if (this->unit_setpoint_sent_ >= 0 && value == this->unit_setpoint_sent_) {
+        // echo of the (possibly compensated) setpoint we sent: keep the user's target
+        if (!std::isnan(this->user_target_))
+          this->target_temperature = this->user_target_;
+        ESP_LOGD(TAG, "Unit setpoint %d (user target %.1f)", value, this->target_temperature);
+      } else if (this->unit_setpoint_sent_ < 0 && !std::isnan(this->user_target_)) {
+        // first read after boot: the unit may hold a compensated setpoint -> restore saved user target
+        this->unit_setpoint_sent_ = value;
+        this->target_temperature = this->user_target_;
+        ESP_LOGI(TAG, "Boot: unit setpoint %d, restored user target %.1f", value, this->user_target_);
+      } else {
+        // setpoint changed on the unit itself (IR remote): treat it as the new user target
+        ESP_LOGI(TAG, "Setpoint changed on the unit to %d, using it as new target", value);
+        this->unit_setpoint_sent_ = value;
+        this->target_temperature = value;
+        this->save_user_target_(value);
+      }
       break;
 
    case ToshibaCommandType::FAN: {
@@ -289,7 +324,8 @@ void ToshibaClimateUart::parseResponse(std::vector<uint8_t> rawData) {
     
    case ToshibaCommandType::ROOM_TEMP:
   ESP_LOGI(TAG, "Received room temp: %d °C", value);
-  if (this->external_sensor_ != nullptr && !isnan(this->external_sensor_->state)) {
+  this->ac_room_temp_ = value;  // AC's own sensor, used for setpoint compensation
+  if (this->external_sensor_ != nullptr && !std::isnan(this->external_sensor_->state)) {
     this->current_temperature = this->external_sensor_->state;
     ESP_LOGI(TAG, "Overriding room temp with external sensor value: %f °C", this->external_sensor_->state);
   } else {
@@ -355,6 +391,7 @@ void ToshibaClimateUart::dump_config() {
     LOG_SELECT("", "Special mode selector", this->special_mode_select_);
   }
   ESP_LOGI(TAG, "Min Temp: %d", this->min_temp_);
+  ESP_LOGCONFIG(TAG, "Setpoint compensation: %s", this->external_sensor_ != nullptr ? "enabled (external sensor)" : "disabled");
 }
 
 /**
@@ -374,107 +411,87 @@ void ToshibaClimateUart::dump_config() {
     this->requestData(ToshibaCommandType::OUTDOOR_TEMP);
   }
 
-  // --- Enhanced Fan speed adjustment logic ---
-  constexpr float LOW_FAN_THRESHOLD = 0.75;    // Temperature difference for LOW fan
-  constexpr float MED_FAN_THRESHOLD = 1.25;    // Temperature difference for MEDIUM fan
-  constexpr float HIGH_FAN_THRESHOLD = 1.75;   // Temperature difference for HIGH fan
-  
-  // Only act if device is ON, not OFF
-  if (this->power_state_ == STATE::ON) {
-    // Ensure we have valid temperatures
-    if (!isnan(this->current_temperature) && !isnan(this->target_temperature)) {
-      float temp_diff = fabs(this->current_temperature - this->target_temperature);
-      bool is_heat_or_cool_mode = (this->mode == climate::CLIMATE_MODE_HEAT || 
-                                   this->mode == climate::CLIMATE_MODE_COOL);
-      
-      ESP_LOGD(TAG, "Fan logic: temp_diff=%.2f, is_heat_or_cool=%d, current_fan=%d", 
-               temp_diff, is_heat_or_cool_mode, this->fan_mode);
+  // --- Setpoint compensation (rate-limited) ---
+  this->apply_setpoint_compensation_(false);
 
-      // 1. HIGH fan when temperature difference is HIGH (> 1.0°C), especially in HEAT or COOL mode
-      if (temp_diff > HIGH_FAN_THRESHOLD) {
-        if (this->fan_mode != CLIMATE_FAN_HIGH && (is_heat_or_cool_mode || this->fan_mode != CLIMATE_FAN_AUTO)) {
-          ESP_LOGI(TAG, "High temp difference detected: current=%.2f, target=%.2f, diff=%.2f - Setting fan to HIGH", 
-                   this->current_temperature, this->target_temperature, temp_diff);
-          this->set_fan_mode_(CLIMATE_FAN_HIGH);
-          this->sendCmd(ToshibaCommandType::FAN, static_cast<uint8_t>(FAN::FAN_HIGH));
-          // Reset delay timer since conditions changed
-          if (this->reached_temp_time_ != 0) {
-            ESP_LOGD(TAG, "Resetting delay timer - conditions changed to HIGH fan requirement");
-            this->reached_temp_time_ = 0;
-          }
-        }
-      }
-        
-      // 2. MEDIUM fan when temperature difference is MEDIUM (~0.5-1.0°C), triggered from HIGH only
-      else if (temp_diff > LOW_FAN_THRESHOLD && temp_diff <= MED_FAN_THRESHOLD && 
-               this->fan_mode == CLIMATE_FAN_HIGH) {
-        ESP_LOGI(TAG, "Medium temp difference detected: current=%.2f, target=%.2f, diff=%.2f - Setting fan to MEDIUM (from HIGH)", 
-                 this->current_temperature, this->target_temperature, temp_diff);
-        this->set_fan_mode_(CLIMATE_FAN_MEDIUM);
-        this->sendCmd(ToshibaCommandType::FAN, static_cast<uint8_t>(FAN::FAN_MEDIUM));
-        // Reset delay timer since we made a manual adjustment
-        if (this->reached_temp_time_ != 0) {
-          ESP_LOGD(TAG, "Resetting delay timer - manual adjustment to MEDIUM fan");
-          this->reached_temp_time_ = 0;
-        }
-      }
-      // 3. LOW fan when temperature difference is LOW (≤ 0.5°C) with delay, 
-      //    but not in HEAT or COOL mode when far from target
-      else if (temp_diff <= LOW_FAN_THRESHOLD && this->fan_mode != CLIMATE_FAN_LOW) {
-        // Don't allow LOW fan in HEAT/COOL mode when we're not actually close to target
-        // This prevents the fan from staying LOW when heating/cooling is still needed
-        if (is_heat_or_cool_mode && temp_diff > (LOW_FAN_THRESHOLD * 0.8)) {
-          ESP_LOGD(TAG, "Preventing LOW fan in HEAT/COOL mode: diff=%.2f still requires active heating/cooling", temp_diff);
-          // Reset timer but don't change fan speed
-          if (this->reached_temp_time_ != 0) {
-            ESP_LOGD(TAG, "Resetting delay timer - not eligible for LOW fan in HEAT/COOL mode");
-            this->reached_temp_time_ = 0;
-          }
-        } else {
-          ESP_LOGI(TAG, "Low temp difference detected: current=%.2f, target=%.2f, diff=%.2f - Starting LOW fan logic", 
-                   this->current_temperature, this->target_temperature, temp_diff);
+  // --- Fan speed adjustment logic (direction-aware) ---
+  // "demand" = how far we still are from the target, in the direction that matters:
+  //   HEAT: target - current   (positive = room still too cold)
+  //   COOL: current - target   (positive = room still too warm)
+  // When demand <= 0 the target is reached or overshot -> slow the fan down.
+  constexpr float HIGH_FAN_DEMAND = 1.75;  // above this -> HIGH
+  constexpr float MED_FAN_DEMAND = 0.75;   // above this -> MEDIUM
+  constexpr float LOW_FAN_DEMAND = 0.0;    // above this -> LOW, otherwise QUIET
 
-          if (this->reached_temp_time_ == 0) {
-            this->reached_temp_time_ = millis();
-            ESP_LOGI(TAG, "Starting fan speed delay timer at %u ms for LOW fan transition", this->reached_temp_time_);
-          } else if (millis() - this->reached_temp_time_ > this->fan_speed_delay_ * 1000) {
-            ESP_LOGI(TAG, "Lowering fan to LOW after %u sec delay - target temperature maintained", this->fan_speed_delay_);
-            this->set_fan_mode_(CLIMATE_FAN_LOW);
-            this->sendCmd(ToshibaCommandType::FAN, static_cast<uint8_t>(FAN::FAN_LOW));
-            // Keep timer running to track LOW fan duration
-          } else {
-            uint32_t remaining = this->fan_speed_delay_ - ((millis() - this->reached_temp_time_) / 1000);
-            ESP_LOGD(TAG, "LOW fan delay in progress: %u seconds remaining", remaining);
-          }
-        }
-      }
-      // 4. Reset delay timer if conditions change or fan mode is not eligible for lowering
-      else {
-        // Conditions have changed - temperature difference no longer qualifies for LOW fan
-        if (this->reached_temp_time_ != 0) {
-          ESP_LOGD(TAG, "Resetting fan speed delay timer - conditions changed (temp_diff=%.2f, fan_mode=%d)", 
-                   temp_diff, this->fan_mode);
-          this->reached_temp_time_ = 0;
-        }
-      }
-    } else {
-      // Invalid temperature readings - reset timer as a safety measure
-      if (this->reached_temp_time_ != 0) {
-        ESP_LOGW(TAG, "Resetting delay timer - invalid temperature readings (cur=%.2f, tgt=%.2f)", 
-                 this->current_temperature, this->target_temperature);
-        this->reached_temp_time_ = 0;
-      }
+  bool is_heat = this->mode == climate::CLIMATE_MODE_HEAT;
+  bool is_cool = this->mode == climate::CLIMATE_MODE_COOL;
+
+  if (this->power_state_ != STATE::ON || !(is_heat || is_cool) || std::isnan(this->current_temperature) ||
+      std::isnan(this->target_temperature)) {
+    // Only manage the fan in HEAT/COOL with valid temperatures; leave the user's choice alone otherwise
+    this->reached_temp_time_ = 0;
+    return;
+  }
+
+  float demand = is_heat ? (this->target_temperature - this->current_temperature)
+                         : (this->current_temperature - this->target_temperature);
+
+  auto fan_rank = [](climate::ClimateFanMode m) -> int {
+    switch (m) {
+      case CLIMATE_FAN_QUIET: return 0;
+      case CLIMATE_FAN_LOW: return 1;
+      case CLIMATE_FAN_MEDIUM: return 2;
+      case CLIMATE_FAN_HIGH: return 3;
+      default: return -1;  // AUTO or custom level: treat as unknown
     }
+  };
+
+  climate::ClimateFanMode wanted;
+  FAN wanted_cmd;
+  if (demand > HIGH_FAN_DEMAND) {
+    wanted = CLIMATE_FAN_HIGH;   wanted_cmd = FAN::FAN_HIGH;
+  } else if (demand > MED_FAN_DEMAND) {
+    wanted = CLIMATE_FAN_MEDIUM; wanted_cmd = FAN::FAN_MEDIUM;
+  } else if (demand > LOW_FAN_DEMAND) {
+    wanted = CLIMATE_FAN_LOW;    wanted_cmd = FAN::FAN_LOW;
   } else {
-    // Device is OFF - reset timer
-    if (this->reached_temp_time_ != 0) {
-      ESP_LOGD(TAG, "Resetting delay timer - device is OFF");
-      this->reached_temp_time_ = 0;
-    }
+    wanted = CLIMATE_FAN_QUIET;  wanted_cmd = FAN::FAN_QUIET;
+  }
+
+  int cur_rank = this->fan_mode.has_value() ? fan_rank(*this->fan_mode) : -1;
+  int want_rank = fan_rank(wanted);
+
+  ESP_LOGD(TAG, "Fan logic: mode=%s cur=%.2f tgt=%.2f demand=%.2f fan_rank=%d wanted_rank=%d",
+           is_heat ? "HEAT" : "COOL", this->current_temperature, this->target_temperature, demand, cur_rank,
+           want_rank);
+
+  if (want_rank == cur_rank) {
+    this->reached_temp_time_ = 0;
+    return;
+  }
+
+  if (want_rank > cur_rank) {
+    // More demand: speed up immediately
+    ESP_LOGI(TAG, "Demand %.2f -> raising fan (rank %d -> %d)", demand, cur_rank, want_rank);
+    this->set_fan_mode_(wanted);
+    this->sendCmd(ToshibaCommandType::FAN, static_cast<uint8_t>(wanted_cmd));
+    this->reached_temp_time_ = 0;
+    this->publish_state();
+    return;
+  }
+
+  // Less demand: slow down only after fan_speed_delay seconds, to avoid flapping
+  if (this->reached_temp_time_ == 0) {
+    this->reached_temp_time_ = millis();
+    ESP_LOGI(TAG, "Demand %.2f -> will lower fan in %u s", demand, (unsigned) this->fan_speed_delay_);
+  } else if (millis() - this->reached_temp_time_ >= this->fan_speed_delay_ * 1000UL) {
+    ESP_LOGI(TAG, "Demand %.2f -> lowering fan (rank %d -> %d)", demand, cur_rank, want_rank);
+    this->set_fan_mode_(wanted);
+    this->sendCmd(ToshibaCommandType::FAN, static_cast<uint8_t>(wanted_cmd));
+    this->reached_temp_time_ = 0;
+    this->publish_state();
   }
 }
- 
-
 
   void ToshibaClimateUart::control(const climate::ClimateCall &call) {
   if (call.get_mode().has_value()) {
@@ -542,9 +559,15 @@ void ToshibaClimateUart::dump_config() {
     }
     // set the target temperature from HA to Climate component
     this->target_temperature = target_temp;
-    // send command to set the target temperature to the unit
-    // (which will be shifted by SPECIAL_TEMP_OFFSET if special mode is active)
-    this->sendCmd(ToshibaCommandType::TARGET_TEMP, newTargetTemp);
+    if (this->special_mode_ == SPECIAL_MODE::EIGHT_DEG || this->external_sensor_ == nullptr) {
+      // send command to set the target temperature to the unit
+      // (which will be shifted by SPECIAL_TEMP_OFFSET if special mode is active)
+      this->sendCmd(ToshibaCommandType::TARGET_TEMP, newTargetTemp);
+      this->unit_setpoint_sent_ = -1;
+    } else {
+      this->save_user_target_(target_temp);
+      // compensated setpoint is sent at the end of control()
+    }
   }
 
   if (call.get_fan_mode().has_value()) {
@@ -590,7 +613,64 @@ void ToshibaClimateUart::dump_config() {
     this->sendCmd(ToshibaCommandType::SWING, static_cast<uint8_t>(function_value));
   }
 
+  // send (compensated) setpoint right away after a user change
+  if (this->special_mode_ != SPECIAL_MODE::EIGHT_DEG && this->external_sensor_ != nullptr &&
+      this->mode != climate::CLIMATE_MODE_OFF) {
+    this->apply_setpoint_compensation_(true);
+  }
+
   this->publish_state();
+}
+
+/**
+ * Compensation is active in HEAT/COOL when both the AC sensor and the external sensor have values.
+ */
+bool ToshibaClimateUart::compensation_active_() {
+  return this->external_sensor_ != nullptr && !std::isnan(this->external_sensor_->state) &&
+         !std::isnan(this->ac_room_temp_) && this->special_mode_ != SPECIAL_MODE::EIGHT_DEG &&
+         (this->mode == climate::CLIMATE_MODE_HEAT || this->mode == climate::CLIMATE_MODE_COOL);
+}
+
+/**
+ * Setpoint to send to the unit. With compensation: target + (AC sensor - room sensor),
+ * e.g. target 19, AC sensor 21, room 19.9 -> offset +1.1 -> unit setpoint 20.
+ */
+uint8_t ToshibaClimateUart::compute_unit_setpoint_() {
+  float sp = this->target_temperature;
+  if (this->compensation_active_()) {
+    float offset = this->ac_room_temp_ - this->external_sensor_->state;
+    if (offset > COMP_MAX_OFFSET) offset = COMP_MAX_OFFSET;
+    if (offset < -COMP_MAX_OFFSET) offset = -COMP_MAX_OFFSET;
+    sp += offset;
+  }
+  long rounded = lroundf(sp);
+  if (rounded < MIN_TEMP_STANDARD) rounded = MIN_TEMP_STANDARD;
+  if (rounded > MAX_TEMP) rounded = MAX_TEMP;
+  return static_cast<uint8_t>(rounded);
+}
+
+void ToshibaClimateUart::apply_setpoint_compensation_(bool force) {
+  if (this->external_sensor_ == nullptr || this->special_mode_ == SPECIAL_MODE::EIGHT_DEG ||
+      this->mode == climate::CLIMATE_MODE_OFF || std::isnan(this->target_temperature))
+    return;
+  uint8_t sp = this->compute_unit_setpoint_();
+  if (static_cast<int16_t>(sp) == this->unit_setpoint_sent_)
+    return;
+  uint32_t now = millis();
+  if (!force && this->unit_setpoint_time_ != 0 && now - this->unit_setpoint_time_ < COMP_MIN_INTERVAL_MS)
+    return;
+  ESP_LOGI(TAG, "Setpoint compensation: user target %.1f, room %.2f, AC sensor %.0f -> unit setpoint %d",
+           this->target_temperature, this->external_sensor_->state, this->ac_room_temp_, sp);
+  this->sendCmd(ToshibaCommandType::TARGET_TEMP, sp);
+  this->unit_setpoint_sent_ = sp;
+  this->unit_setpoint_time_ = now;
+}
+
+void ToshibaClimateUart::save_user_target_(float t) {
+  if (this->user_target_ == t)
+    return;
+  this->user_target_ = t;
+  this->target_pref_.save(&t);
 }
 
 ClimateTraits ToshibaClimateUart::traits() {

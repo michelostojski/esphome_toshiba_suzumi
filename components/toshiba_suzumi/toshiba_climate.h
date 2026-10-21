@@ -7,6 +7,8 @@
 #include "esphome/components/select/select.h"
 #include "toshiba_climate_mode.h"
 #include "esphome/core/component.h"
+#include "esphome/core/preferences.h"
+#include <cmath>
 
 
 
@@ -66,6 +68,20 @@ class ToshibaClimateUart : public PollingComponent, public climate::Climate, pub
   // --- FAN SPEED DELAY MEMBERS ---
   uint32_t fan_speed_delay_ = 30;     // Delay in seconds, default 30
   uint32_t reached_temp_time_ = 0;    // Timestamp when target temp reached
+
+  // --- SETPOINT COMPENSATION (external sensor) ---
+  // The AC regulates on its own internal sensor. When an external room sensor is configured,
+  // the setpoint sent to the unit is shifted by (AC sensor - external sensor) so the unit
+  // stops when the *room* reaches the target.
+  float ac_room_temp_ = NAN;          // last room temp reported by the AC's own sensor
+  float user_target_ = NAN;           // target the user asked for (persisted across reboots)
+  int16_t unit_setpoint_sent_ = -1;   // setpoint last sent to / read from the unit (-1 = unknown)
+  uint32_t unit_setpoint_time_ = 0;   // millis() of last compensated setpoint change
+  ESPPreferenceObject target_pref_;
+  bool compensation_active_();
+  uint8_t compute_unit_setpoint_();
+  void apply_setpoint_compensation_(bool force);
+  void save_user_target_(float t);
 
  private:
   std::vector<uint8_t> rx_message_;

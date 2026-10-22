@@ -8,7 +8,14 @@ from esphome.const import (
     DEVICE_CLASS_TEMPERATURE,
     __version__ as ESPHOME_VERSION
 )
-from packaging import version
+import re
+
+
+def _version_tuple(v):
+    """Parse '2026.10.0' / '2026.10.0b1' / '2026.11.0-dev' into (2026, 10, 0) without 'packaging'
+    (no longer shipped with ESPHome >= 2026.10)."""
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3])
+
 import logging
 
 _LOGGER = logging.getLogger(__name__)
@@ -32,7 +39,7 @@ ToshibaPwrModeSelect = toshiba_ns.class_('ToshibaPwrModeSelect', select.Select)
 ToshibaSpecialModeSelect = toshiba_ns.class_('ToshibaSpecialModeSelect', select.Select)
 CONF_EXTERNAL_SENSOR_ID = "external_sensor_id"
 
-if version.parse(ESPHOME_VERSION) >= version.parse("2025.5.0"):
+if _version_tuple(ESPHOME_VERSION) >= (2025, 5, 0):
     _LOGGER.info("[TOSHIBA SUZUMI] Using new climate schema (ESPHome >= 2025.5.0)")
     CONFIG_SCHEMA = climate.climate_schema(ToshibaClimateUart).extend(
         {
